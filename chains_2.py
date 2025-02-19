@@ -39,6 +39,7 @@ verbs_branch_chain = (
     | StrOutputParser()
 )
 
+# error: only one thread for base users
 chain = (
     prompt
     | model
