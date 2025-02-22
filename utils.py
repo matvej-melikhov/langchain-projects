@@ -4,7 +4,7 @@ from os import environ as env
 from langchain_gigachat.chat_models import GigaChat
 
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 def init_gigachat_model() -> GigaChat:
