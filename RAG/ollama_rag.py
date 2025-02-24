@@ -1,10 +1,11 @@
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.document_loaders import CSVLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.schema import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain_ollama.llms import OllamaLLM
 
 import os
 import sys
@@ -50,9 +51,10 @@ else:
 retriever = db.as_retriever(search_type="similarity", search_kwargs={'k': 1})
 
 # creating LLM
-llm = utils.init_gigachat_model()
+llm = OllamaLLM(model="gemma:latest")
 
 # contextualizing question prompt
+# prompt to reformulate the question based on the chat history
 contextualize_q_system_prompt = (
     'Твоя задача — переформулировать вопрос пользователя с учетом истории сообщений так, '
     'чтобы он стал понятен без контекста предыдущих сообщений. '
@@ -61,48 +63,44 @@ contextualize_q_system_prompt = (
     'Например, если в истории говорили про Трампа, а вопрос "Какой у него рост?", '
     'результат должен быть: "Переформулированный вопрос: Какой рост у Трампа?"'
 )
+
 contextualize_q_prompt = ChatPromptTemplate.from_messages([
     ('system', contextualize_q_system_prompt),
     MessagesPlaceholder('chat_history'),
-    ('human', '{input}. Переформулированный вопрос: '),
+    ('human', '{input}'),
 ])
+
+# creating a history-aware retriever
+# uses LLM to reformulate the question based on chat history
+history_aware_retriever = create_history_aware_retriever(
+    llm=llm,
+    retriever=retriever,
+    prompt=contextualize_q_prompt,
+)
 
 # QA-prompt
 qa_system_prompt = (
     'Твоя задача — ответить на вопрос пользователя ТОЛЬКО на основе контекста, '
     'приведенного ниже. Ты не должен использовать свои общие знания '
     'или любые другие источники, кроме указанного контекста. '
+    'А также привести источник информации из контекста. '
     'Если в контексте нет информации для ответа, напиши ровно одну фразу: '
-    '"Я не знаю ответа, так как в контексте нет нужной информации."'
+    'Я не знаю ответа, так как в контексте нет нужной информации. '
+    'Если в контексте есть ответ, тогда приведи ответ и источник информации.'
     '\n\nКонтекст:\n{context}'
 )
+
 qa_prompt = ChatPromptTemplate.from_messages([
     ('system', qa_system_prompt),
     MessagesPlaceholder('chat_history'),
     ('human', '{input}'),
 ])
 
-# retrieving context by rephrased query
-def get_context(reprased_query):
-    docs = retriever.invoke(reprased_query)
-    return '\n'.join([doc.page_content for doc in docs])
-
-# rephrasing query based on previous messages
-rephrase_chain = (
-    contextualize_q_prompt
-    | llm
-    | StrOutputParser()
-)
-
-# QA-chain
-qa_chain = (
-    RunnablePassthrough.assign(
-        input=rephrase_chain,
-        context=lambda x: get_context(x['input']),
-    )
-    | qa_prompt
-    | llm
-    | StrOutputParser()
+# building RAG
+qa_chain = create_stuff_documents_chain(llm=llm, prompt=qa_prompt)
+rag_chain = create_retrieval_chain(
+    retriever=history_aware_retriever,
+    combine_docs_chain=qa_chain,
 )
 
 # QA-loop
@@ -116,10 +114,10 @@ while True:
     if query == 'quit':
         break
 
-    answer = qa_chain.invoke(
-        {'input': query,
-         'chat_history': chat_history}
-    )
+    answer = rag_chain.invoke({
+        'input': query,
+        'chat_history': chat_history,
+    })['answer']
 
     print(f'> {answer}\n')
 
